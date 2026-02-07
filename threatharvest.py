@@ -1,17 +1,22 @@
+
 import pandas as pd
 import requests
 import logging
+import datetime
+import os
+import json
+import glob
+from groq import Groq
 from rich.console import Console
 from rich.table import Table
-from rich.table import Table
-import datetime
-import json
-import os
+from rich.panel import Panel
+from rich.text import Text
 
 # Configuration
 URLHAUS_CSV_URL = "https://urlhaus.abuse.ch/downloads/csv_recent/"
 FEODO_BLOCKLIST_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.csv"
-OUTPUT_FILE = "threat_intel_feed.json"
+KNOWLEDGE_BASE_FILE = "threat_knowledge_base.json"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 
 # Setup Logging
@@ -109,11 +114,48 @@ def enrich_ip(df):
         df['country'] = 'Unknown'
     return df
 
+def load_previous_data():
+    """Loads the most recent previous threat feed (JSON) for trend analysis."""
+    # Find all threat_feed_*.json files
+    files = glob.glob("threat_feed_*.json")
+    if not files:
+        return pd.DataFrame()
+    
+    # Sort by name (which contains date) to get the latest
+    files.sort(reverse=True)
+    
+    # Get today's filename to avoid comparing against itself if run multiple times same day
+    today_filename = f"threat_feed_{datetime.date.today()}.json"
+    
+    target_file = None
+    for f in files:
+        if f != today_filename:
+            target_file = f
+            break
+            
+    if not target_file:
+        return pd.DataFrame()
+        
+    logging.info(f"Loading previous data from {target_file} for trend analysis.")
+    try:
+        with open(target_file, 'r') as f:
+            data = json.load(f)
+        return pd.DataFrame(data)
+    except Exception as e:
+        logging.error(f"Error loading previous data: {e}")
+        return pd.DataFrame()
+
 def generate_report(df):
-    """Generates console report using Rich."""
+    """Generates console report using Rich with Trend Analysis."""
     if df.empty:
         console.print("[bold red]No data to report.[/bold red]")
         return
+
+    # Load previous data for trends
+    df_prev = load_previous_data()
+    prev_counts = {}
+    if not df_prev.empty and 'threat_tag' in df_prev.columns:
+        prev_counts = df_prev['threat_tag'].value_counts().to_dict()
 
     # Top 10 Malwares (Threat Tags)
     top_threats = df['threat_tag'].value_counts().head(10)
@@ -122,9 +164,21 @@ def generate_report(df):
     table.add_column("Rank", justify="right", style="cyan", no_wrap=True)
     table.add_column("Malware / Tag", style="magenta")
     table.add_column("Count", justify="right", style="green")
+    table.add_column("Trend", justify="center")
 
     for idx, (tag, count) in enumerate(top_threats.items(), 1):
-        table.add_row(str(idx), str(tag), str(count))
+        trend_str = "[dim]=[/dim]"
+        if tag in prev_counts:
+            delta = count - prev_counts[tag]
+            if delta > 0:
+                trend_str = f"[bold red]+{delta} ^[/bold red]"
+            elif delta < 0:
+                trend_str = f"[bold green]{delta} v[/bold green]"
+        elif not df_prev.empty:
+             # Only show "New" if we actually have previous data to compare against
+             trend_str = "[bold orange1]New *[/bold orange1]"
+             
+        table.add_row(str(idx), str(tag), str(count), trend_str)
 
     console.print(table)
     
@@ -152,15 +206,139 @@ def generate_report(df):
             
     console.print(f"\n[bold]Total IOCs Collected:[/bold] {len(df)}")
 
+def load_knowledge_base():
+    """Loads the local threat knowledge base JSON."""
+    if os.path.exists(KNOWLEDGE_BASE_FILE):
+        try:
+            with open(KNOWLEDGE_BASE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Error loading knowledge base: {e}")
+            return {}
+    return {}
+
+def save_knowledge_base(kb):
+    """Saves the threat knowledge base to JSON."""
+    try:
+        with open(KNOWLEDGE_BASE_FILE, 'w') as f:
+            json.dump(kb, f, indent=4)
+    except Exception as e:
+        logging.error(f"Error saving knowledge base: {e}")
+
+def analyze_threat_with_ai(tag, kb):
+    """
+    Analyzes a threat tag using AI (Groq) or Knowledge Base.
+    Returns a dict with keys: family, description, risk, source.
+    """
+    # 1. Check Cache
+    if tag in kb:
+        result = kb[tag]
+        result['source'] = 'Cache'
+        return result
+
+    # 2. Check API Key
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return {"family": "Unknown", "description": "AI features disabled (No API Key).", "risk": "Unknown", "source": "Skipped"}
+    
+    # 3. Ask Groq
+    try:
+        client = Groq(api_key=api_key)
+        prompt = f"""
+        Analyze this malware threat tag: "{tag}".
+        Provide a JSON response with exactly these fields:
+        - "family": The malware family name (e.g., Mirai, Cobalt Strike).
+        - "description": A very short description (max 15 words).
+        - "risk": Risk level (Low, Medium, High, Critical).
+        
+        Return ONLY valid JSON. No markdown formatting.
+        """
+        
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a cybersecurity expert. Output only JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            model=GROQ_MODEL,
+            temperature=0.1,
+        )
+        
+        response_content = chat_completion.choices[0].message.content.strip()
+        # Clean potential markdown code blocks if Llama includes them
+        if response_content.startswith("```"):
+            response_content = response_content.strip("`").replace("json", "").strip()
+            
+        analysis = json.loads(response_content)
+        
+        # 4. Save to Cache
+        kb[tag] = analysis
+        save_knowledge_base(kb)
+        
+        analysis['source'] = 'AI Live'
+        return analysis
+
+    except Exception as e:
+        logging.error(f"AI Analysis failed for {tag}: {e}")
+        return {"family": "Unknown", "description": "Analysis failed.", "risk": "Unknown", "source": "Error"}
+
+def generate_ai_briefing(df):
+    """Generates an AI-powered Strategic Briefing for top threats."""
+    if df.empty:
+        return
+
+    console.print()
+    console.print(Panel("[bold yellow][AI] Strategic Briefing[/bold yellow]", expand=False))
+    
+    # Get top 5 unique tags for briefing to save time/tokens
+    top_tags = df['threat_tag'].value_counts().head(5).index.tolist()
+    
+    kb = load_knowledge_base()
+    
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Threat Tag", style="dim", width=30)
+    table.add_column("Family", style="cyan")
+    table.add_column("Description")
+    table.add_column("Risk", justify="center")
+    table.add_column("Source", style="italic")
+
+    with console.status("[bold green]Analyzing threats with AI...[/bold green]"):
+        for tag in top_tags:
+            # Skip "Unknown" tags if possible or handle them gracefully
+            if tag.lower() == 'unknown':
+                continue
+                
+            analysis = analyze_threat_with_ai(tag, kb)
+            
+            risk_style = "white"
+            risk = analysis.get('risk', 'Unknown')
+            if risk == 'Critical': risk_style = "bold red"
+            elif risk == 'High': risk_style = "red"
+            elif risk == 'Medium': risk_style = "yellow"
+            
+            source_style = "blue" if analysis.get('source') == 'AI Live' else "green"
+            
+            table.add_row(
+                tag,
+                analysis.get('family', 'N/A'),
+                analysis.get('description', 'N/A'),
+                f"[{risk_style}]{risk}[/{risk_style}]",
+                f"[{source_style}]{analysis.get('source', 'Unknown')}[/{source_style}]"
+            )
+
+    console.print(table)
+
 
 def save_data(df):
-    """Saves consolidated data to JSON."""
+    """Saves consolidated data to JSON with date-based filename."""
     try:
         # Convert to list of dicts for JSON export, handling dates strings
         result = df.to_dict(orient='records')
-        with open(OUTPUT_FILE, 'w') as f:
+        
+        filename = f"threat_feed_{datetime.date.today()}.json"
+        
+        with open(filename, 'w') as f:
             json.dump(result, f, indent=4)
-        logging.info(f"Data saved to {OUTPUT_FILE}")
+        logging.info(f"Data saved to {filename}")
     except Exception as e:
         logging.error(f"Error saving data: {e}")
 
@@ -204,6 +382,9 @@ def main():
         
         # Report
         generate_report(df_combined)
+        
+        # AI Briefing
+        generate_ai_briefing(df_combined)
         
         # Save
         # Convert date back to string for JSON serialization

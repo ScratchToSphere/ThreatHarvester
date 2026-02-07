@@ -1,0 +1,31 @@
+{
+    "32-bit,elf,mips,Mozi": {
+        "family": "Mozi",
+        "description": "MIPS-based IoT malware",
+        "risk": "High",
+        "source": "AI Live"
+    },
+    "elf,mirai,ua-wget": {
+        "family": "Mirai",
+        "description": "Malicious ELF file",
+        "risk": "High",
+        "source": "AI Live"
+    },
+    "botnetdomain,mirai,opendir": {
+        "family": "Mirai",
+        "description": "Malicious botnet",
+        "risk": "High",
+        "source": "AI Live"
+    },
+    "botnetdomain,mirai": {
+        "family": "Mirai",
+        "description": "Malicious botnet malware",
+        "risk": "High",
+        "source": "AI Live"
+    },
+    "32-bit,elf,Mozi": {
+        "family": "Mozi",
+        "description": "IoT malware",
+        "risk": "High"
+    }
+}
