@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
+import matplotlib.pyplot as plt
 
 # Configuration
 URLHAUS_CSV_URL = "https://urlhaus.abuse.ch/downloads/csv_recent/"
@@ -114,6 +115,81 @@ def enrich_ip(df):
         df['country'] = 'Unknown'
     return df
 
+def get_new_entrants(df_today, df_prev):
+    """Identifies threat tags present today but not in the previous report."""
+    if df_today.empty or 'threat_tag' not in df_today.columns:
+        return []
+    
+    today_tags = set(df_today['threat_tag'].unique())
+    
+    if df_prev.empty or 'threat_tag' not in df_prev.columns:
+        # If no previous data, strictly speaking everything is new, 
+        # but for noise reduction let's return all ONLY if it's the very first run,
+        # or maybe return nothing to avoid alarm fatigue?
+        # User asked: "Identifie les 'New Entrants' : Les familles de malwares présentes aujourd'hui qui n'existaient PAS dans le fichier d'hier"
+        # If no yesterday file, we can't properly identify "new entrants" vs "just started script".
+        # Let's return empty to be safe, or maybe top 10? 
+        # Let's return empty if no history to compare against.
+        return []
+        
+    prev_tags = set(df_prev['threat_tag'].unique())
+    
+    new_entrants = list(today_tags - prev_tags)
+    return new_entrants
+
+def generate_dashboard(df, new_entrants):
+    """Generates a PNG dashboard with Top 20 threats and New Detections."""
+    if df.empty:
+        return
+
+    try:
+        # Style
+        plt.style.use('dark_background')
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 9), gridspec_kw={'width_ratios': [2, 1]})
+        fig.suptitle(f'ThreatHarvest Dashboard - {datetime.date.today()}', fontsize=20, color='white')
+
+        # Chart 1: Top 20
+        top_20 = df['threat_tag'].value_counts().head(20).sort_values(ascending=True) # Sort asc for horizontal bar chart
+        
+        bars = ax1.barh(top_20.index, top_20.values, color='#00ff41')
+        ax1.set_title('Top 20 Malware Families', fontsize=14, color='white')
+        ax1.set_xlabel('Volume (Count)', fontsize=12, color='white')
+        ax1.tick_params(axis='y', colors='white', labelsize=10)
+        ax1.tick_params(axis='x', colors='white')
+        
+        # Add values on bars
+        for i, v in enumerate(top_20.values):
+            ax1.text(v + 3, i, str(v), color='white', va='center', fontweight='bold')
+
+        # Chart 2: New Detections List
+        ax2.axis('off')
+        ax2.set_title('[!] NEW DETECTIONS', fontsize=16, color='red', fontweight='bold')
+        
+        text_content = ""
+        if new_entrants:
+            # Show top 30 new entrants if too many, to fit screen
+            limit = 30
+            display_list = new_entrants[:limit]
+            text_content = "\n".join([f"• {tag}" for tag in display_list])
+            if len(new_entrants) > limit:
+                text_content += f"\n\n... and {len(new_entrants) - limit} more."
+        else:
+            text_content = "Aucune nouvelle menace détectée."
+            
+        ax2.text(0.05, 0.95, text_content, transform=ax2.transAxes, fontsize=12, color='white', verticalalignment='top', wrap=True)
+
+        # Save
+        filename = f"threat_dashboard_{datetime.date.today()}.png"
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(filename, dpi=100, facecolor='black')
+        plt.close()
+        
+        logging.info(f"Dashboard saved to {filename}")
+
+
+    except Exception as e:
+        logging.error(f"Error generating dashboard: {e}")
+
 def load_previous_data():
     """Loads the most recent previous threat feed (JSON) for trend analysis."""
     # Find all threat_feed_*.json files
@@ -160,6 +236,9 @@ def generate_report(df):
     # Top 10 Malwares (Threat Tags)
     top_threats = df['threat_tag'].value_counts().head(10)
 
+    # Calculate New Entrants
+    new_entrants = get_new_entrants(df, df_prev)
+
     table = Table(title="Top 10 Malwares of the Day")
     table.add_column("Rank", justify="right", style="cyan", no_wrap=True)
     table.add_column("Malware / Tag", style="magenta")
@@ -181,8 +260,22 @@ def generate_report(df):
         table.add_row(str(idx), str(tag), str(count), trend_str)
 
     console.print(table)
+
+    # New Detections Section
+    if new_entrants:
+        console.print()
+        console.print(Panel(
+            "\n".join([f"[red]> {tag}[/red]" for tag in new_entrants[:10]]) + 
+            (f"\n\n[dim]... and {len(new_entrants)-10} more[/dim]" if len(new_entrants) > 10 else ""),
+            title="[bold red][!] NOUVELLES MENACES DETECTEES[/bold red]",
+            border_style="red",
+            expand=False
+        ))
+    else:
+        console.print("\n[bold green]Aucune nouvelle menace détectée par rapport au précédent rapport.[/bold green]")
     
-    # Bar Chart Visualization
+    # Dashboard Generation
+    generate_dashboard(df, new_entrants)
     console.print() 
     console.print("[bold cyan]Top Malware Distribution[/bold cyan]")
     
