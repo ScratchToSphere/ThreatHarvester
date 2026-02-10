@@ -10,8 +10,11 @@ from groq import Groq
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.text import Text
 import matplotlib.pyplot as plt
+import matplotlib
+
+# Suppress matplotlib font warnings
+matplotlib.rc('font', family='DejaVu Sans')
 
 # Configuration
 URLHAUS_CSV_URL = "https://urlhaus.abuse.ch/downloads/csv_recent/"
@@ -20,20 +23,32 @@ KNOWLEDGE_BASE_FILE = "threat_knowledge_base.json"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 
+# Directory Structure
+DATA_DIR = "data"
+OUTPUT_DIR = os.path.join("output", str(datetime.date.today()))  # output/YYYY-MM-DD/
+
+# Architecture terms to filter from malware family extraction
+ARCHITECTURE_TERMS = {
+    'elf', '32-bit', '64-bit', 'arm', 'mips', 'intel', 'sh', 'powerpc',
+    'x86', 'x64', 'amd64', 'i386', 'i686', 'armv7', 'aarch64'
+}
+
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 console = Console()
+
+def initialize_directories():
+    """Creates required directory structure if it doesn't exist."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    logging.info(f"Directories initialized: {DATA_DIR}, {OUTPUT_DIR}")
 
 def fetch_urlhaus():
     """Fetches and parses URLhaus CSV."""
     logging.info("Fetching URLhaus data...")
     try:
         df = pd.read_csv(URLHAUS_CSV_URL, skiprows=8, header=0, skipinitialspace=True)
-        # Clean and rename
-        # URLhaus headers usually: id,dateadded,url,url_status,last_online,threat,tags,urlhaus_link,reporter
-        # We need: date, ioc_value, ioc_type, threat_tag, source
         
-        # Filter strictly for 'id' to ensure we have a valid row, though pandas handles this reasonably well
         if df.empty:
             logging.warning("URLhaus data is empty.")
             return pd.DataFrame()
@@ -41,20 +56,13 @@ def fetch_urlhaus():
         df['source'] = 'URLhaus'
         df['ioc_type'] = 'url'
         
-        # Rename columns to match schema
-        # dateadded -> date
-        # url -> ioc_value
-        # tags -> threat_tag (might need handling for NaNs)
-        
         df.rename(columns={
             'dateadded': 'date',
             'url': 'ioc_value', 
             'tags': 'threat_tag'
         }, inplace=True)
         
-        # Select and reorder
         required_cols = ['date', 'ioc_value', 'ioc_type', 'threat_tag', 'source']
-        # Ensure all columns exist, fill if missing
         for col in required_cols:
             if col not in df.columns:
                 df[col] = None
@@ -69,9 +77,7 @@ def fetch_feodo():
     """Fetches and parses Feodo Tracker CSV."""
     logging.info("Fetching Feodo Tracker data...")
     try:
-        # Feodo data often has comments at top. Need to handle skiprows carefully or use comment='#'
-        df = pd.read_csv(FEODO_BLOCKLIST_URL, skiprows=8,  skipinitialspace=True)
-        # Expected headers: first_seen_utc, dst_ip, dst_port, c2_status, last_seen_utc, malware
+        df = pd.read_csv(FEODO_BLOCKLIST_URL, skiprows=8, skipinitialspace=True)
         
         if df.empty:
             logging.warning("Feodo Tracker data is empty.")
@@ -80,22 +86,10 @@ def fetch_feodo():
         df['source'] = 'FeodoTracker'
         df['ioc_type'] = 'ip:port'
         
-        # Rename
-        # first_seen_utc -> date
-        # dst_ip -> ioc_value (Combine with port maybe? request said "standardise columns", let's keep it simple for now or combine)
-        # Request said "Blocklist IP", usually just IP. But Feodo tracks C2 IPs and Ports. 
-        # Let's use dst_ip as ioc_value for now, and maybe append port if needed, but IOC usually implies the observable.
-        # Let's combine IP:PORT for ioc_value as that is more useful for C2.
-        
         df['ioc_value'] = df['dst_ip'] + ':' + df['dst_port'].astype(str)
         df.rename(columns={'first_seen_utc': 'date', 'malware': 'threat_tag'}, inplace=True)
         
-        # Enrich country if available? Feodo CSV usually doesn't have country column in standard blocklist.
-        # Check https://feodotracker.abuse.ch/downloads/ipblocklist.csv content structure.
-        # Actually, let's verify if 'country' is in there. 
-        
         required_cols = ['date', 'ioc_value', 'ioc_type', 'threat_tag', 'source']
-         # Ensure all columns exist
         for col in required_cols:
             if col not in df.columns:
                 df[col] = None
@@ -106,102 +100,87 @@ def fetch_feodo():
         logging.error(f"Error fetching Feodo Tracker: {e}")
         return pd.DataFrame()
 
-def enrich_ip(df):
-    """Enriches IP data with Country if possible."""
-    # For now, minimal implementation. 
-    # If the source provided country, we would use it. 
-    # Since we are sticking to basic Pandas, we will add a placeholder or simple logic if applicable.
-    if 'country' not in df.columns:
-        df['country'] = 'Unknown'
-    return df
-
-def get_new_entrants(df_today, df_prev):
-    """Identifies threat tags present today but not in the previous report."""
-    if df_today.empty or 'threat_tag' not in df_today.columns:
-        return []
+def extract_malware_family(raw_tag):
+    """
+    Extracts malware family name from raw threat tag.
+    Removes architecture-specific terms and returns the family name.
+    """
+    if pd.isna(raw_tag) or raw_tag == 'Unknown':
+        return 'Unknown'
     
-    today_tags = set(df_today['threat_tag'].unique())
+    # Split by comma first (primary delimiter)
+    parts = [p.strip() for p in raw_tag.split(',')]
     
-    if df_prev.empty or 'threat_tag' not in df_prev.columns:
-        # If no previous data, strictly speaking everything is new, 
-        # but for noise reduction let's return all ONLY if it's the very first run,
-        # or maybe return nothing to avoid alarm fatigue?
-        # User asked: "Identifie les 'New Entrants' : Les familles de malwares présentes aujourd'hui qui n'existaient PAS dans le fichier d'hier"
-        # If no yesterday file, we can't properly identify "new entrants" vs "just started script".
-        # Let's return empty to be safe, or maybe top 10? 
-        # Let's return empty if no history to compare against.
-        return []
+    # Filter out architecture terms and look for capitalized family names
+    family_candidates = []
+    for part in parts:
+        # Check if entire part is an architecture term
+        if part.lower() in ARCHITECTURE_TERMS:
+            continue
         
-    prev_tags = set(df_prev['threat_tag'].unique())
+        # Check if part contains hyphens (like "32-bit")
+        if '-' in part:
+            # Split by hyphen and check each sub-part
+            sub_parts = part.split('-')
+            # If any sub-part is architecture term, skip the whole thing
+            if any(sp.lower() in ARCHITECTURE_TERMS for sp in sub_parts):
+                continue
+        
+        # Valid candidate if it's longer than 2 chars
+        if len(part) > 2:
+            family_candidates.append(part)
     
-    new_entrants = list(today_tags - prev_tags)
-    return new_entrants
+    # Prioritize capitalized names (likely family names like "Mozi", "Mirai")
+    for candidate in family_candidates:
+        if candidate[0].isupper():
+            return candidate
+    
+    # Otherwise return first valid candidate
+    if family_candidates:
+        return family_candidates[0].capitalize()
+    
+    return 'Unknown'
 
-def generate_dashboard(df, new_entrants):
-    """Generates a PNG dashboard with Top 20 threats and New Detections."""
+def standardize_data(df):
+    """
+    Standardizes data schema with snake_case keys and ISO timestamps.
+    Adds malware_family, collected_at fields.
+    """
     if df.empty:
-        return
-
-    try:
-        # Style
-        plt.style.use('dark_background')
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 9), gridspec_kw={'width_ratios': [2, 1]})
-        fig.suptitle(f'ThreatHarvest Dashboard - {datetime.date.today()}', fontsize=20, color='white')
-
-        # Chart 1: Top 20
-        top_20 = df['threat_tag'].value_counts().head(20).sort_values(ascending=True) # Sort asc for horizontal bar chart
-        
-        bars = ax1.barh(top_20.index, top_20.values, color='#00ff41')
-        ax1.set_title('Top 20 Malware Families', fontsize=14, color='white')
-        ax1.set_xlabel('Volume (Count)', fontsize=12, color='white')
-        ax1.tick_params(axis='y', colors='white', labelsize=10)
-        ax1.tick_params(axis='x', colors='white')
-        
-        # Add values on bars
-        for i, v in enumerate(top_20.values):
-            ax1.text(v + 3, i, str(v), color='white', va='center', fontweight='bold')
-
-        # Chart 2: New Detections List
-        ax2.axis('off')
-        ax2.set_title('[!] NEW DETECTIONS', fontsize=16, color='red', fontweight='bold')
-        
-        text_content = ""
-        if new_entrants:
-            # Show top 30 new entrants if too many, to fit screen
-            limit = 30
-            display_list = new_entrants[:limit]
-            text_content = "\n".join([f"• {tag}" for tag in display_list])
-            if len(new_entrants) > limit:
-                text_content += f"\n\n... and {len(new_entrants) - limit} more."
-        else:
-            text_content = "Aucune nouvelle menace détectée."
-            
-        ax2.text(0.05, 0.95, text_content, transform=ax2.transAxes, fontsize=12, color='white', verticalalignment='top', wrap=True)
-
-        # Save
-        filename = f"threat_dashboard_{datetime.date.today()}.png"
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(filename, dpi=100, facecolor='black')
-        plt.close()
-        
-        logging.info(f"Dashboard saved to {filename}")
-
-
-    except Exception as e:
-        logging.error(f"Error generating dashboard: {e}")
+        return df
+    
+    # Parse dates
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    
+    # Add ISO 8601 timestamp
+    df['collected_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    # Fill NaN values
+    df['ioc_value'] = df['ioc_value'].fillna('Unknown')
+    df['ioc_type'] = df['ioc_type'].fillna('Unknown')
+    df['threat_tag'] = df['threat_tag'].fillna('Unknown')
+    df['source'] = df['source'].fillna('Unknown')
+    
+    # Extract malware family
+    df['malware_family'] = df['threat_tag'].apply(extract_malware_family)
+    
+    # Sort by date
+    df.sort_values(by='date', ascending=False, inplace=True)
+    
+    # Convert date to string for JSON serialization
+    df['date'] = df['date'].dt.strftime('%Y-%m-%d %H:%M:%S').fillna('Unknown')
+    
+    return df
 
 def load_previous_data():
     """Loads the most recent previous threat feed (JSON) for trend analysis."""
-    # Find all threat_feed_*.json files
-    files = glob.glob("threat_feed_*.json")
+    files = glob.glob(os.path.join(DATA_DIR, "threat_feed_*.json"))
     if not files:
         return pd.DataFrame()
     
-    # Sort by name (which contains date) to get the latest
     files.sort(reverse=True)
     
-    # Get today's filename to avoid comparing against itself if run multiple times same day
-    today_filename = f"threat_feed_{datetime.date.today()}.json"
+    today_filename = os.path.join(DATA_DIR, f"threat_feed_{datetime.date.today()}.json")
     
     target_file = None
     for f in files:
@@ -221,83 +200,20 @@ def load_previous_data():
         logging.error(f"Error loading previous data: {e}")
         return pd.DataFrame()
 
-def generate_report(df):
-    """Generates console report using Rich with Trend Analysis."""
-    if df.empty:
-        console.print("[bold red]No data to report.[/bold red]")
-        return
-
-    # Load previous data for trends
-    df_prev = load_previous_data()
-    prev_counts = {}
-    if not df_prev.empty and 'threat_tag' in df_prev.columns:
-        prev_counts = df_prev['threat_tag'].value_counts().to_dict()
-
-    # Top 10 Malwares (Threat Tags)
-    top_threats = df['threat_tag'].value_counts().head(10)
-
-    # Calculate New Entrants
-    new_entrants = get_new_entrants(df, df_prev)
-
-    table = Table(title="Top 10 Malwares of the Day")
-    table.add_column("Rank", justify="right", style="cyan", no_wrap=True)
-    table.add_column("Malware / Tag", style="magenta")
-    table.add_column("Count", justify="right", style="green")
-    table.add_column("Trend", justify="center")
-
-    for idx, (tag, count) in enumerate(top_threats.items(), 1):
-        trend_str = "[dim]=[/dim]"
-        if tag in prev_counts:
-            delta = count - prev_counts[tag]
-            if delta > 0:
-                trend_str = f"[bold red]+{delta} ^[/bold red]"
-            elif delta < 0:
-                trend_str = f"[bold green]{delta} v[/bold green]"
-        elif not df_prev.empty:
-             # Only show "New" if we actually have previous data to compare against
-             trend_str = "[bold orange1]New *[/bold orange1]"
-             
-        table.add_row(str(idx), str(tag), str(count), trend_str)
-
-    console.print(table)
-
-    # New Detections Section
-    if new_entrants:
-        console.print()
-        console.print(Panel(
-            "\n".join([f"[red]> {tag}[/red]" for tag in new_entrants[:10]]) + 
-            (f"\n\n[dim]... and {len(new_entrants)-10} more[/dim]" if len(new_entrants) > 10 else ""),
-            title="[bold red][!] NOUVELLES MENACES DETECTEES[/bold red]",
-            border_style="red",
-            expand=False
-        ))
-    else:
-        console.print("\n[bold green]Aucune nouvelle menace détectée par rapport au précédent rapport.[/bold green]")
+def get_new_entrants(df_today, df_prev):
+    """Identifies threat tags present today but not in the previous report."""
+    if df_today.empty or 'threat_tag' not in df_today.columns:
+        return []
     
-    # Dashboard Generation
-    generate_dashboard(df, new_entrants)
-    console.print() 
-    console.print("[bold cyan]Top Malware Distribution[/bold cyan]")
+    today_tags = set(df_today['threat_tag'].unique())
     
-    if not top_threats.empty:
-        max_count = top_threats.max()
-        chart_width = 50
+    if df_prev.empty or 'threat_tag' not in df_prev.columns:
+        return []
         
-        for tag, count in top_threats.items():
-            # Truncate label 
-            label = str(tag)
-            if len(label) > 25:
-                label = label[:22] + "..."
-            
-            # Calculate bar length
-            bar_len = int((count / max_count) * chart_width)
-            bar = "#" * bar_len
-            
-            # Print row
-            # Format: Label | Bar Count
-            console.print(f"{label:<26} [magenta]{bar}[/magenta] [green]{count}[/green]")
-            
-    console.print(f"\n[bold]Total IOCs Collected:[/bold] {len(df)}")
+    prev_tags = set(df_prev['threat_tag'].unique())
+    
+    new_entrants = list(today_tags - prev_tags)
+    return new_entrants
 
 def load_knowledge_base():
     """Loads the local threat knowledge base JSON."""
@@ -357,7 +273,7 @@ def analyze_threat_with_ai(tag, kb):
         )
         
         response_content = chat_completion.choices[0].message.content.strip()
-        # Clean potential markdown code blocks if Llama includes them
+        # Clean potential markdown code blocks
         if response_content.startswith("```"):
             response_content = response_content.strip("`").replace("json", "").strip()
             
@@ -374,15 +290,416 @@ def analyze_threat_with_ai(tag, kb):
         logging.error(f"AI Analysis failed for {tag}: {e}")
         return {"family": "Unknown", "description": "Analysis failed.", "risk": "Unknown", "source": "Error"}
 
-def generate_ai_briefing(df):
-    """Generates an AI-powered Strategic Briefing for top threats."""
-    if df.empty:
+def generate_pie_chart(df):
+    """Generates pie chart for Top 5 malware families distribution."""
+    if df.empty or 'malware_family' not in df.columns:
         return
+    
+    try:
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Get top 5 families
+        family_counts = df['malware_family'].value_counts().head(5)
+        
+        colors = ['#00ff41', '#ff4444', '#ffaa00', '#00aaff', '#ff00ff']
+        
+        wedges, texts, autotexts = ax.pie(
+            family_counts.values, 
+            labels=family_counts.index,
+            autopct='%1.1f%%',
+            colors=colors,
+            startangle=90,
+            textprops={'color': 'white', 'fontsize': 12}
+        )
+        
+        for autotext in autotexts:
+            autotext.set_color('black')
+            autotext.set_fontweight('bold')
+        
+        ax.set_title('Top 5 Malware Families Distribution', fontsize=16, color='white', pad=20)
+        
+        filename = os.path.join(OUTPUT_DIR, "distrib_famille.png")
+        plt.tight_layout()
+        plt.savefig(filename, dpi=100, facecolor='black')
+        plt.close()
+        
+        logging.info(f"Pie chart saved to {filename}")
+    except Exception as e:
+        logging.error(f"Error generating pie chart: {e}")
 
+def generate_histogram(df_today, df_prev):
+    """Generates histogram comparing today's vs yesterday's threat volume."""
+    try:
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        today_count = len(df_today) if not df_today.empty else 0
+        yesterday_count = len(df_prev) if not df_prev.empty else 0
+        
+        labels = ['Yesterday', 'Today']
+        counts = [yesterday_count, today_count]
+        colors = ['#ffaa00', '#00ff41']
+        
+        bars = ax.bar(labels, counts, color=colors, edgecolor='white', linewidth=2)
+        
+        # Add value labels on bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{int(height):,}',
+                   ha='center', va='bottom', color='white', fontsize=14, fontweight='bold')
+        
+        ax.set_ylabel('Total Threats', fontsize=12, color='white')
+        ax.set_title('Threat Volume Evolution', fontsize=16, color='white', pad=20)
+        ax.tick_params(colors='white')
+        ax.spines['bottom'].set_color('white')
+        ax.spines['left'].set_color('white')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        filename = os.path.join(OUTPUT_DIR, "evolution_volumetrie.png")
+        plt.tight_layout()
+        plt.savefig(filename, dpi=100, facecolor='black')
+        plt.close()
+        
+        logging.info(f"Histogram saved to {filename}")
+    except Exception as e:
+        logging.error(f"Error generating histogram: {e}")
+
+def generate_html_report(df, new_entrants, ai_briefing_data):
+    """Generates HTML report with dark mode styling."""
+    today = datetime.date.today()
+    filename = os.path.join(OUTPUT_DIR, f"report_{today}.html")
+    
+    try:
+        # Get top 10 for table
+        top_10 = df['threat_tag'].value_counts().head(10)
+        
+        # Build HTML
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ThreatHarvest Report - {today}</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            background: #0a0a0a;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 20px;
+            line-height: 1.6;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        h1 {{
+            color: #00ff41;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+            text-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
+        }}
+        .date {{
+            text-align: center;
+            color: #888;
+            margin-bottom: 40px;
+            font-size: 1.2em;
+        }}
+        .section {{
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 25px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        }}
+        h2 {{
+            color: #00ff41;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #00ff41;
+            padding-bottom: 10px;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }}
+        th {{
+            background: #00ff41;
+            color: #000;
+            padding: 12px;
+            text-align: left;
+            font-weight: bold;
+        }}
+        td {{
+            padding: 10px 12px;
+            border-bottom: 1px solid #333;
+        }}
+        tr:hover {{
+            background: #252525;
+        }}
+        .chart-container {{
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
+            gap: 20px;
+            margin-top: 20px;
+        }}
+        .chart {{
+            flex: 1;
+            min-width: 400px;
+            text-align: center;
+        }}
+        .chart img {{
+            max-width: 100%;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }}
+        .ai-summary {{
+            background: #1a2a1a;
+            border-left: 4px solid #00ff41;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }}
+        .new-threats {{
+            background: #2a1a1a;
+            border-left: 4px solid #ff4444;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }}
+        .new-threats h3 {{
+            color: #ff4444;
+            margin-bottom: 15px;
+        }}
+        .threat-list {{
+            list-style: none;
+            padding-left: 0;
+        }}
+        .threat-list li {{
+            padding: 8px 0;
+            border-bottom: 1px solid #333;
+        }}
+        .threat-list li:before {{
+            content: "▸ ";
+            color: #ff4444;
+            font-weight: bold;
+        }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .stat-box {{
+            background: #252525;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            border: 1px solid #333;
+        }}
+        .stat-number {{
+            font-size: 2.5em;
+            color: #00ff41;
+            font-weight: bold;
+        }}
+        .stat-label {{
+            color: #888;
+            margin-top: 10px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🛡️ ThreatHarvest Intelligence Report</h1>
+        <div class="date">{today.strftime('%B %d, %Y')}</div>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-number">{len(df):,}</div>
+                <div class="stat-label">Total IOCs Collected</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number">{len(df['malware_family'].unique())}</div>
+                <div class="stat-label">Unique Malware Families</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number">{len(new_entrants)}</div>
+                <div class="stat-label">New Threats Detected</div>
+            </div>
+        </div>
+"""
+        
+        # AI Strategic Summary
+        if ai_briefing_data:
+            html += """
+        <div class="section">
+            <h2>🧠 AI Strategic Briefing</h2>
+            <div class="ai-summary">
+                <table>
+                    <tr>
+                        <th>Threat Tag</th>
+                        <th>Family</th>
+                        <th>Description</th>
+                        <th>Risk</th>
+                        <th>Source</th>
+                    </tr>
+"""
+            for item in ai_briefing_data:
+                risk_color = '#ff4444' if item['risk'] in ['Critical', 'High'] else '#ffaa00' if item['risk'] == 'Medium' else '#00ff41'
+                html += f"""
+                    <tr>
+                        <td>{item['tag']}</td>
+                        <td>{item['family']}</td>
+                        <td>{item['description']}</td>
+                        <td style="color: {risk_color}; font-weight: bold;">{item['risk']}</td>
+                        <td>{item['source']}</td>
+                    </tr>
+"""
+            html += """
+                </table>
+            </div>
+        </div>
+"""
+        
+        # New Threats
+        if new_entrants:
+            html += """
+        <div class="section">
+            <div class="new-threats">
+                <h3>⚠️ New Threats Detected</h3>
+                <ul class="threat-list">
+"""
+            for threat in new_entrants[:20]:  # Limit to 20 for readability
+                html += f"                    <li>{threat}</li>\n"
+            
+            if len(new_entrants) > 20:
+                html += f"                    <li><em>... and {len(new_entrants) - 20} more</em></li>\n"
+            
+            html += """
+                </ul>
+            </div>
+        </div>
+"""
+        
+        # Visualizations
+        html += """
+        <div class="section">
+            <h2>📊 Threat Analysis Visualizations</h2>
+            <div class="chart-container">
+                <div class="chart">
+                    <h3>Malware Family Distribution</h3>
+                    <img src="distrib_famille.png" alt="Malware Family Distribution">
+                </div>
+                <div class="chart">
+                    <h3>Volume Evolution</h3>
+                    <img src="evolution_volumetrie.png" alt="Volume Evolution">
+                </div>
+            </div>
+        </div>
+"""
+        
+        # Top 10 Table
+        html += """
+        <div class="section">
+            <h2>🎯 Top 10 Threats</h2>
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Threat Tag</th>
+                    <th>Count</th>
+                </tr>
+"""
+        for idx, (tag, count) in enumerate(top_10.items(), 1):
+            html += f"""
+                <tr>
+                    <td>{idx}</td>
+                    <td>{tag}</td>
+                    <td>{count:,}</td>
+                </tr>
+"""
+        
+        html += """
+            </table>
+        </div>
+    </div>
+</body>
+</html>
+"""
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html)
+        
+        logging.info(f"HTML report saved to {filename}")
+    except Exception as e:
+        logging.error(f"Error generating HTML report: {e}")
+
+def generate_console_report(df, df_prev, new_entrants):
+    """Generates console report using Rich with Trend Analysis."""
+    if df.empty:
+        console.print("[bold red]No data to report.[/bold red]")
+        return
+    
+    prev_counts = {}
+    if not df_prev.empty and 'threat_tag' in df_prev.columns:
+        prev_counts = df_prev['threat_tag'].value_counts().to_dict()
+    
+    top_threats = df['threat_tag'].value_counts().head(10)
+    
+    table = Table(title="Top 10 Malwares of the Day")
+    table.add_column("Rank", justify="right", style="cyan", no_wrap=True)
+    table.add_column("Malware / Tag", style="magenta")
+    table.add_column("Count", justify="right", style="green")
+    table.add_column("Trend", justify="center")
+    
+    for idx, (tag, count) in enumerate(top_threats.items(), 1):
+        trend_str = "[dim]=[/dim]"
+        if tag in prev_counts:
+            delta = count - prev_counts[tag]
+            if delta > 0:
+                trend_str = f"[bold red]+{delta} ^[/bold red]"
+            elif delta < 0:
+                trend_str = f"[bold green]{delta} v[/bold green]"
+        elif not df_prev.empty:
+            trend_str = "[bold orange1]New *[/bold orange1]"
+             
+        table.add_row(str(idx), str(tag), str(count), trend_str)
+    
+    console.print(table)
+    
+    # New Detections Section
+    if new_entrants:
+        console.print()
+        console.print(Panel(
+            "\n".join([f"[red]> {tag}[/red]" for tag in new_entrants[:10]]) + 
+            (f"\n\n[dim]... and {len(new_entrants)-10} more[/dim]" if len(new_entrants) > 10 else ""),
+            title="[bold red][!] NOUVELLES MENACES DETECTEES[/bold red]",
+            border_style="red",
+            expand=False
+        ))
+    else:
+        console.print("\n[bold green]Aucune nouvelle menace détectée par rapport au précédent rapport.[/bold green]")
+    
+    console.print(f"\n[bold]Total IOCs Collected:[/bold] {len(df):,}")
+    console.print(f"[bold]Unique Malware Families:[/bold] {len(df['malware_family'].unique())}")
+
+def generate_ai_briefing(df):
+    """Generates AI-powered Strategic Briefing for top threats."""
+    if df.empty:
+        return []
+    
     console.print()
     console.print(Panel("[bold yellow][AI] Strategic Briefing[/bold yellow]", expand=False))
     
-    # Get top 5 unique tags for briefing to save time/tokens
     top_tags = df['threat_tag'].value_counts().head(5).index.tolist()
     
     kb = load_knowledge_base()
@@ -393,10 +710,11 @@ def generate_ai_briefing(df):
     table.add_column("Description")
     table.add_column("Risk", justify="center")
     table.add_column("Source", style="italic")
-
+    
+    briefing_data = []
+    
     with console.status("[bold green]Analyzing threats with AI...[/bold green]"):
         for tag in top_tags:
-            # Skip "Unknown" tags if possible or handle them gracefully
             if tag.lower() == 'unknown':
                 continue
                 
@@ -417,17 +735,24 @@ def generate_ai_briefing(df):
                 f"[{risk_style}]{risk}[/{risk_style}]",
                 f"[{source_style}]{analysis.get('source', 'Unknown')}[/{source_style}]"
             )
-
+            
+            briefing_data.append({
+                'tag': tag,
+                'family': analysis.get('family', 'N/A'),
+                'description': analysis.get('description', 'N/A'),
+                'risk': risk,
+                'source': analysis.get('source', 'Unknown')
+            })
+    
     console.print(table)
-
+    return briefing_data
 
 def save_data(df):
     """Saves consolidated data to JSON with date-based filename."""
     try:
-        # Convert to list of dicts for JSON export, handling dates strings
         result = df.to_dict(orient='records')
         
-        filename = f"threat_feed_{datetime.date.today()}.json"
+        filename = os.path.join(DATA_DIR, f"threat_feed_{datetime.date.today()}.json")
         
         with open(filename, 'w') as f:
             json.dump(result, f, indent=4)
@@ -438,6 +763,10 @@ def save_data(df):
 def main():
     console.print("[bold blue]ThreatHarvest Started...[/bold blue]")
     
+    # Initialize directory structure
+    initialize_directories()
+    
+    # Fetch data
     df_urlhaus = fetch_urlhaus()
     df_feodo = fetch_feodo()
     
@@ -446,46 +775,35 @@ def main():
     
     if df_combined.empty:
         logging.warning("No data collected from any source.")
-    else:
-        # Basic cleanup
-        df_combined['date'] = pd.to_datetime(df_combined['date'], errors='coerce')
-        
-        # Fill NaT dates with a default low value for sorting, or drop them. 
-        # Let's keep them but put them at the end.
-        # Actually, let's just drop rows without a valid date if strictly needed, 
-        # but better to assume current time or just handle NaT. 
-        # Pandas 2.x sorts NaT to the end by default in ascending=False (or beginning?). 
-        # Let's fill NaT with a dummy date for stability if needed, but NaT is usually fine if we don't mix with strings.
-        
-        # We need to avoiding filling NaT with 'Unknown' yet.
-        # Fill other columns
-        df_combined['ioc_value'] = df_combined['ioc_value'].fillna('Unknown')
-        df_combined['ioc_type'] = df_combined['ioc_type'].fillna('Unknown')
-        df_combined['threat_tag'] = df_combined['threat_tag'].fillna('Unknown')
-        df_combined['source'] = df_combined['source'].fillna('Unknown')
-        
-        # Enrichment
-        df_combined = enrich_ip(df_combined)
-        
-        # Sort by date
-        df_combined.sort_values(by='date', ascending=False, inplace=True)
-        
-        # Now we can convert date to string for display/export and fill NaT
-        df_combined['date'] = df_combined['date'].dt.strftime('%Y-%m-%d %H:%M:%S').fillna('Unknown')
-        
-        # Report
-        generate_report(df_combined)
-        
-        # AI Briefing
-        generate_ai_briefing(df_combined)
-        
-        # Save
-        # Convert date back to string for JSON serialization
-        df_export = df_combined.copy()
-        df_export['date'] = df_export['date'].astype(str)
-        save_data(df_export)
-
+        return
+    
+    # Standardize data
+    df_combined = standardize_data(df_combined)
+    
+    # Load previous data for comparison
+    df_prev = load_previous_data()
+    
+    # Get new entrants
+    new_entrants = get_new_entrants(df_combined, df_prev)
+    
+    # Console Report
+    generate_console_report(df_combined, df_prev, new_entrants)
+    
+    # AI Briefing
+    ai_briefing_data = generate_ai_briefing(df_combined)
+    
+    # Generate Visualizations
+    generate_pie_chart(df_combined)
+    generate_histogram(df_combined, df_prev)
+    
+    # Generate HTML Report
+    generate_html_report(df_combined, new_entrants, ai_briefing_data)
+    
+    # Save data
+    save_data(df_combined)
+    
     console.print("[bold blue]ThreatHarvest Finished.[/bold blue]")
+    console.print(f"[bold green]Report available at: {os.path.join(OUTPUT_DIR, f'report_{datetime.date.today()}.html')}[/bold green]")
 
 if __name__ == "__main__":
     main()
